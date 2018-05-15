@@ -226,8 +226,17 @@ class AttnDecoderRNN(Block):
         return output, hidden, attn_weights
 
     def initHidden(self, ctx):
-        # return [F.zeros((1, self.hidden_size), ctx=ctx)]
         return [F.zeros((1, 1, self.hidden_size), ctx=ctx)]
+
+    def export(self, prefix):
+        self.embedding.export(prefix + '_decoder_embedding')
+        self.attn.export(prefix + '_decoder_attn')
+        self.attn_combine.export(prefix + '_decoder_attn_combine')
+        if self.dropout_p > 0:
+            self.dropout.export(prefix + '_decoder_dropout')
+        # self.gru = rnn.GRU(self.hidden_size, input_size=self.hidden_size)
+        self.gru.export(prefix + '_decoder_gru')
+        self.out.export(prefix + '_decoder_out')
 
 
 class EncoderRNN(Block):
@@ -250,11 +259,11 @@ class EncoderRNN(Block):
         return output, hidden
 
     def initHidden(self, ctx):
-        # return [F.zeros((1, self.hidden_size), ctx=ctx)]
         return [F.zeros((1, 1, self.hidden_size), ctx=ctx)]
 
     def export(self, prefix):
-        self.embedding.export(prefix + '_embedding')
+        self.embedding.export(prefix + '_encoder_embedding')
+        self.gru.export(prefix + '_encoder_gru')
 
 
 def train(input_variable, target_variable, encoder, decoder, teacher_forcing_ratio,
@@ -366,7 +375,9 @@ attn_decoder = AttnDecoderRNN(opt.hidden_size, output_lang.n_words,
 
 if opt.test:
     encoder.load_params('checkpoints/encoder.params')
+    encoder.hybridize()
     attn_decoder.load_params('checkpoints/decoder.params')
+    attn_decoder.hybridize()
 
     input = variableFromSentence(input_lang, "je vais bien .")
     input_length = input.shape[0]
@@ -398,5 +409,8 @@ if opt.test:
         decoder_input = F.array([topi.asscalar()], ctx=ctx)
 
     print(' '.join(output_tokens))
+
+    encoder.export('symbols/encoder')
+    attn_decoder.export('symbols/decoder')
 else:
     trainIters(encoder, attn_decoder, ctx, opt)
