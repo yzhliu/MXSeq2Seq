@@ -43,7 +43,6 @@ SOS_token = 0
 EOS_token = 1
 
 
-
 class Lang:
     def __init__(self, name):
         self.name = name
@@ -140,11 +139,6 @@ def prepareData(lang1, lang2, max_length, reverse=False):
     return input_lang, output_lang, pairs
 
 
-if not opt.test:
-    input_lang, output_lang, pairs = prepareData('eng', 'fra', opt.max_length, True)
-    print random.choice(pairs)
-
-
 def indexesFromSentence(lang, sentence):
     return [lang.word2index[word] for word in sentence.split(' ')]
 
@@ -162,6 +156,32 @@ def variablesFromPair(pair):
     return (input_variable, target_variable)
 
 
+def gru_unroll(gru, length, inputs, states, layout='TNC', merge_outputs=None):
+    axis = layout.find('T')
+    outputs = []
+    for i in range(length):
+        output, states = gru(inputs[i], states)
+        outputs.append(output)
+    if merge_outputs:
+        outputs = F.stack(*inputs, axis=axis)
+    return outputs, states
+
+
+def gru_forward(gru, inputs, states, layout='TNC'):
+    """forward using gluon GRUCell"""
+    ns = len(states)
+    axis = layout.find('T')
+    states = sum(zip(*((j for j in i) for i in states)), ())
+    outputs, states = gru_unroll(gru,
+        inputs.shape[axis], inputs, states,
+        layout=layout, merge_outputs=True)
+    new_states = []
+    for i in range(ns):
+        state = F.concat(*(j.reshape((1,) + j.shape) for j in states[i::ns]), dim=0)
+        new_states.append(state)
+
+    return outputs, new_states
+
 
 class AttnDecoderRNN(Block):
     def __init__(self, hidden_size, output_size, n_layers, max_length, dropout_p=0.1):
@@ -178,7 +198,8 @@ class AttnDecoderRNN(Block):
             self.attn_combine = nn.Dense(self.hidden_size, in_units=self.hidden_size * 2)
             if self.dropout_p > 0:
                 self.dropout = nn.Dropout(self.dropout_p)
-            self.gru = rnn.GRU(self.hidden_size, input_size=self.hidden_size)
+            # self.gru = rnn.GRU(self.hidden_size, input_size=self.hidden_size)
+            self.gru = rnn.GRUCell(self.hidden_size, input_size=self.hidden_size)
             self.out = nn.Dense(self.output_size, in_units=self.hidden_size)
 
     def forward(self, input, hidden, encoder_outputs):
@@ -197,13 +218,15 @@ class AttnDecoderRNN(Block):
 
         for i in range(self.n_layers):
             output = F.relu(output)
-            output, hidden = self.gru(output, hidden)
+            # output, hidden = self.gru(output, hidden)
+            output, hidden = gru_forward(self.gru, output, hidden)
 
         output = self.out(output)
 
         return output, hidden, attn_weights
 
     def initHidden(self, ctx):
+        # return [F.zeros((1, self.hidden_size), ctx=ctx)]
         return [F.zeros((1, 1, self.hidden_size), ctx=ctx)]
 
 
@@ -215,19 +238,23 @@ class EncoderRNN(Block):
 
         with self.name_scope():
             self.embedding = nn.Embedding(input_size, hidden_size)
-            self.gru = rnn.GRU(hidden_size, input_size=self.hidden_size)
+            # self.gru = rnn.GRU(hidden_size, input_size=self.hidden_size)
+            self.gru = rnn.GRUCell(hidden_size, input_size=self.hidden_size)
 
     def forward(self, input, hidden):
         ##input shape, (seq,)
         output = self.embedding(input).swapaxes(0, 1)
         for i in range(self.n_layers):
-            output, hidden = self.gru(output, hidden)
+            # output, hidden = self.gru(output, hidden)
+            output, hidden = gru_forward(self.gru, output, hidden)
         return output, hidden
 
     def initHidden(self, ctx):
+        # return [F.zeros((1, self.hidden_size), ctx=ctx)]
         return [F.zeros((1, 1, self.hidden_size), ctx=ctx)]
 
-
+    def export(self, prefix):
+        self.embedding.export(prefix + '_embedding')
 
 
 def train(input_variable, target_variable, encoder, decoder, teacher_forcing_ratio,
@@ -249,8 +276,6 @@ def train(input_variable, target_variable, encoder, decoder, teacher_forcing_rat
         else:
             encoder_outputs = encoder_outputs.flatten()
 
-
-
         decoder_input = F.array([SOS_token], ctx=ctx)
 
         decoder_hidden = encoder_hidden
@@ -264,7 +289,7 @@ def train(input_variable, target_variable, encoder, decoder, teacher_forcing_rat
                     decoder_input, decoder_hidden, encoder_outputs)
 
                 loss = F.add(loss, criterion(decoder_output, target_variable[di]))
-                print criterion(decoder_output, target_variable[di])
+                print(criterion(decoder_output, target_variable[di]))
                 decoder_input = target_variable[di]  # Teacher forcing
 
         else:
@@ -320,7 +345,10 @@ def trainIters(encoder, decoder, ctx, opt):
         if iter % print_every == 0:
             print_loss_avg = print_loss_total / print_every
             print_loss_total = 0
-            print print_loss_avg
+            print(print_loss_avg)
+
+    encoder.save_params('checkpoints/encoder.params')
+    decoder.save_params('checkpoints/decoder.params')
 
 
 
@@ -329,46 +357,46 @@ if opt.cuda:
 else:
     ctx = mx.cpu()
 
-if opt.test:
-    encoder = EncoderRNN(5, 10, 1)
-    encoder.initialize()
-
-    for i in encoder.collect_params().values():
-        i.data()[:] = 1.0
-
-    input = F.array([[0]])
-
-    hidden = encoder.initHidden(ctx=mx.cpu())
-
-    o, h = encoder(input, hidden)
-
-    print 'encoder'
-    print '=========='
-    print o.asnumpy()
-    print h[0].asnumpy()
-    print '=========='
-
-    attn_decoder = AttnDecoderRNN(2, 5, 1, 10, 0.1)
-    attn_decoder.initialize()
-
-    for i in attn_decoder.collect_params().values():
-        i.data()[:] = 1.0
-
-    input = F.array([0])
-    hidden = attn_decoder.initHidden(ctx=mx.cpu())
-
-    o, h, a = attn_decoder(input, hidden, 0.5*F.ones((10, 2)))
-
-    print 'attn_decoder'
-    print '=========='
-    print o.asnumpy()
-    print h[0].asnumpy()
-    print '=========='
-
-    assert False
+input_lang, output_lang, pairs = prepareData('eng', 'fra', opt.max_length, True)
+# print(random.choice(pairs))
 
 encoder = EncoderRNN(input_lang.n_words, opt.hidden_size, opt.num_layers)
 attn_decoder = AttnDecoderRNN(opt.hidden_size, output_lang.n_words,
-                               opt.num_layers, opt.max_length, dropout_p=0.1)
+                              opt.num_layers, opt.max_length, dropout_p=0.1)
 
-trainIters(encoder, attn_decoder, ctx, opt)
+if opt.test:
+    encoder.load_params('checkpoints/encoder.params')
+    attn_decoder.load_params('checkpoints/decoder.params')
+
+    input = variableFromSentence(input_lang, "je vais bien .")
+    input_length = input.shape[0]
+
+    input = input.expand_dims(0)
+
+    hidden = encoder.initHidden(ctx=mx.cpu())
+
+    encoder_outputs, encoder_hidden = encoder(input, hidden)
+    if input_length < opt.max_length:
+        encoder_outputs = F.concat(encoder_outputs.flatten(),
+                                   F.zeros((opt.max_length - input_length, encoder.hidden_size), ctx=ctx), dim=0)
+    else:
+        encoder_outputs = encoder_outputs.flatten()
+
+
+    decoder_input = F.array([SOS_token], ctx=ctx)
+    decoder_hidden = encoder_hidden
+
+    output_tokens = []
+    while True:
+        decoder_output, decoder_hidden, decoder_attention = attn_decoder(
+            decoder_input, decoder_hidden, encoder_outputs)
+        topi = decoder_output.argmax(axis=1)
+        token = output_lang.index2word[topi.asscalar()]
+        if token == 'EOS':
+            break
+        output_tokens.append(token)
+        decoder_input = F.array([topi.asscalar()], ctx=ctx)
+
+    print(' '.join(output_tokens))
+else:
+    trainIters(encoder, attn_decoder, ctx, opt)
