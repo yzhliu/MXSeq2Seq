@@ -126,7 +126,6 @@ def filterPairs(pairs, max_length):
 
 def prepareData(lang1, lang2, max_length, reverse=False):
     input_lang, output_lang, pairs = readLangs(lang1, lang2, reverse)
-    print("Read %s sentence pairs" % len(pairs))
     pairs = filterPairs(pairs, max_length)
     print("Trimmed to %s sentence pairs" % len(pairs))
     print("Counting words...")
@@ -156,39 +155,15 @@ def variablesFromPair(pair):
     return (input_variable, target_variable)
 
 
-def gru_unroll(gru, length, inputs, states, layout='TNC', merge_outputs=None):
+def gru_forward(gru, inputs, states, layout='TNC'):
     axis = layout.find('T')
+    length = inputs.shape[axis]
     outputs = []
     for i in range(length):
-        # print('inputs[%d] shape: %s' % (i, str(inputs[i].shape)))
-        # print('states[0] shape: ' + str(states[0].shape))
         output, states = gru(inputs[i], states)
         outputs.append(output)
-    # print('outputs : ' + str(outputs))
-    # print('inputs :' + str(inputs))
-    if merge_outputs:
-        outputs = F.stack(*outputs, axis=axis)
-        # print('output shape: ' + str(outputs.shape))
+    outputs = F.stack(*outputs, axis=axis)
     return outputs, states
-
-
-def gru_forward(gru, inputs, states, layout='TNC'):
-    """forward using gluon GRUCell"""
-    ns = len(states)
-    axis = layout.find('T')
-    print('states before: ' + str(states))
-    states = sum(zip(*((j for j in i) for i in states)), ())
-    print('states after: ' + str(states))
-    outputs, states = gru_unroll(gru,
-        inputs.shape[axis], inputs, states,
-        layout=layout, merge_outputs=True)
-    print('states by gru_unroll: ' + str(states))
-    new_states = []
-    for i in range(ns):
-        state = F.concat(*(j.reshape((1,) + j.shape) for j in states[i::ns]), dim=0)
-        new_states.append(state)
-
-    return outputs, new_states
 
 
 class AttnDecoderRNN(Block):
@@ -206,7 +181,6 @@ class AttnDecoderRNN(Block):
             self.attn_combine = nn.Dense(self.hidden_size, in_units=self.hidden_size * 2)
             if self.dropout_p > 0:
                 self.dropout = nn.Dropout(self.dropout_p)
-            # self.gru = rnn.GRU(self.hidden_size, input_size=self.hidden_size)
             self.gru = rnn.GRUCell(self.hidden_size, input_size=self.hidden_size)
             self.out = nn.Dense(self.output_size, in_units=self.hidden_size)
 
@@ -226,15 +200,13 @@ class AttnDecoderRNN(Block):
 
         for i in range(self.n_layers):
             output = F.relu(output)
-            # output, hidden = self.gru(output, hidden)
             output, hidden = gru_forward(self.gru, output, hidden)
 
         output = self.out(output)
-
         return output, hidden, attn_weights
 
     def initHidden(self, ctx):
-        return [F.zeros((1, 1, self.hidden_size), ctx=ctx)]
+        return [F.zeros((1, self.hidden_size), ctx=ctx)]
 
     def export(self, prefix):
         self.embedding.export(prefix + '_embedding')
@@ -242,7 +214,6 @@ class AttnDecoderRNN(Block):
         self.attn_combine.export(prefix + '_attn_combine')
         if self.dropout_p > 0:
             self.dropout.export(prefix + '_dropout')
-        # self.gru = rnn.GRU(self.hidden_size, input_size=self.hidden_size)
         self.gru.export(prefix + '_gru')
         self.out.export(prefix + '_out')
 
@@ -255,21 +226,17 @@ class EncoderRNN(Block):
 
         with self.name_scope():
             self.embedding = nn.Embedding(input_size, hidden_size)
-            # self.gru = rnn.GRU(hidden_size, input_size=self.hidden_size)
             self.gru = rnn.GRUCell(hidden_size, input_size=self.hidden_size)
 
     def forward(self, input, hidden):
         ##input shape, (seq,)
-        # print(input.shape)
         output = self.embedding(input).swapaxes(0, 1)
-        # print('embedding = ' + str(output))
         for i in range(self.n_layers):
-            # output, hidden = self.gru(output, hidden)
             output, hidden = gru_forward(self.gru, output, hidden)
         return output, hidden
 
     def initHidden(self, ctx):
-        return [F.zeros((1, 1, self.hidden_size), ctx=ctx)]
+        return [F.zeros((1, self.hidden_size), ctx=ctx)]
 
     def export(self, prefix):
         self.embedding.export(prefix + '_embedding')
@@ -383,7 +350,6 @@ encoder = EncoderRNN(input_lang.n_words, opt.hidden_size, opt.num_layers)
 attn_decoder = AttnDecoderRNN(opt.hidden_size, output_lang.n_words,
                               opt.num_layers, opt.max_length, dropout_p=0.1)
 
-print(input_lang.n_words)
 print(opt)
 
 if opt.test:
@@ -393,7 +359,6 @@ if opt.test:
     attn_decoder.hybridize()
 
     input = variableFromSentence(input_lang, "je vais bien .")
-    print('input array = ' + str(input))
     input_length = input.shape[0]
 
     input = input.expand_dims(0)
@@ -406,7 +371,6 @@ if opt.test:
                                    F.zeros((opt.max_length - input_length, encoder.hidden_size), ctx=ctx), dim=0)
     else:
         encoder_outputs = encoder_outputs.flatten()
-
 
     decoder_input = F.array([SOS_token], ctx=ctx)
     decoder_hidden = encoder_hidden
